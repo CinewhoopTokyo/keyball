@@ -20,6 +20,32 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "quantum.h"
 
+// --- 押下中だけ低CPI（精密モード / サニパー） --------------------------------
+// Remapで USER00 (0x7E40) を好きなキーに割り当てて使う。押している間だけ低CPI、
+// 離すと元のCPIに戻る（現在CPIを退避するので普段CPIを上げていてもOK）。
+enum custom_keycodes {
+    CPI_PREC = KEYBALL_SAFE_RANGE,   // = QK_USER_0 = 0x7E40（Remap: USER00）
+};
+
+#define PRECISION_CPI 2              // 押下中のCPI（×100 → 2 = 200CPI）。1=100 / 3=300 で調整可
+
+static uint8_t saved_cpi = 0;
+
+bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    switch (keycode) {
+        case CPI_PREC:
+            if (record->event.pressed) {
+                saved_cpi = keyball_get_cpi();   // 現在のCPIを退避
+                keyball_set_cpi(PRECISION_CPI);  // 精密モードへ
+            } else {
+                keyball_set_cpi(saved_cpi);      // 離したら元のCPIへ復帰
+            }
+            return false;
+    }
+    return true;
+}
+// --------------------------------------------------------------------------
+
 // clang-format off
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
   // keymap for default (VIA)
