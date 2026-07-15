@@ -20,12 +20,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "quantum.h"
 
-// --- 押下中だけ低CPI（精密モード） ---------------------------------------
+// --- 押下中だけ低CPI（精密モード / サニパー） --------------------------------
+// Remapで USER00 (0x7E40) を好きなキーに割り当てて使う。押している間だけ低CPI、
+// 離すと元のCPIに戻る（現在CPIを退避するので普段CPIを上げていてもOK）。
 enum custom_keycodes {
-    CPI_PREC = KEYBALL_SAFE_RANGE,   // 押下中だけ低CPIにする精密モードキー（= VIA USER00 / 0x7E40）
+    CPI_PREC = KEYBALL_SAFE_RANGE,   // = QK_USER_0 = 0x7E40（Remap: USER00）
 };
 
-#define PRECISION_CPI 4              // 押下中のCPI（×100単位 → 4 = 400CPI）
+#define PRECISION_CPI 2              // 押下中のCPI（×100 → 2 = 200CPI）。1=100 / 3=300 で調整可
 
 static uint8_t saved_cpi = 0;
 
@@ -41,75 +43,6 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             return false;
     }
     return true;
-}
-// ------------------------------------------------------------------------
-
-// --- ポインター速度制御：高解像度(高CPI) + 縮小係数 + 端数キャリー ----------
-// 考え方：
-//  - 解像度は CPI を上げて稼ぐ（例：従来500の3倍 = 1500CPI を実機で設定する）。
-//  - その移動量にファーム側で縮小係数 SPEED_PCT を掛けてカーソル速度を決める。
-//    例: CPI3倍 × SPEED_PCT=33% ≒ 従来と同等の速度。係数を下げれば更に遅く=精密。
-//  - 縮小で出る端数は次レポートへ持ち越す（キャリー）ので低速の微小移動が消えない。
-//    → 同じ速度でも高解像度ぶん滑らかで細かく狙える。
-//  - EXPO_MAX を 100 超にすると、速い動きだけ追加で加速（任意・既定はOFF）。
-// 数字は感覚で調整可。変更したら再ビルドするだけ。
-// ※ floatは使わない（ATmega32U4はフラッシュが厳しいため整数のみで計算）。
-
-#define SPEED_PCT    25   // 速度係数(縮小率) ×100。低速の基準速度。下げると全体的に遅く=精密
-#define EXPO_MAX   1200   // 高速時のexpoゲイン ×100（実効最大 = SPEED_PCT×EXPO_MAX/100 = 0.25×12 = 3倍。macOS加速ON前提で控えめ）
-#define EXPO_CURVE    2   // expoカーブの鋭さ（整数: 2=中盤が持ち上がる / 3=中央が鈍くexpo風）
-#define EXPO_REF     80   // 「全速」とみなす1レポートの移動量（小さいほど早く最大加速に到達）
-
-static uint32_t expo_lut[128];   // a×expoゲイン ×256（unityスケール）
-static int32_t  carry_x, carry_y;
-
-// 動き始めランプ（時間ベース）：トラックボールの"周り始めの硬さ"で出る初動スパイクを抑える。
-// 停止→動き出しの最初だけゲインを絞り、ONSET_MS かけて通常へ戻す。報告レートに依らず一定時間。
-#define ONSET_MS    120   // 動き始めにこの時間[ms]かけて通常ゲインへ立ち上げる（大=ゆっくり立上り）
-#define ONSET_MIN    25   // 動き始めの倍率 ×100（小さいほど初動を強く抑える, 100=ランプ無効）
-#define ONSET_GAP_MS 80   // この時間[ms]以上停止したら「動き始め」とみなしランプ再武装
-static uint32_t onset_start, onset_last;
-
-void keyboard_post_init_user(void) {
-    uint32_t ref_pow = 1;
-    for (uint8_t c = 0; c < EXPO_CURVE; c++) ref_pow *= EXPO_REF;
-    for (uint16_t i = 0; i < 128; i++) {
-        uint32_t ip   = (i < EXPO_REF) ? i : EXPO_REF;   // i/EXPO_REF を 1.0 で頭打ち
-        uint32_t inum = 1;
-        for (uint8_t c = 0; c < EXPO_CURVE; c++) inum *= ip;
-        uint32_t gain100 = 100 + (uint32_t)(EXPO_MAX - 100) * inum / ref_pow;  // ×100, 100=等倍
-        expo_lut[i] = (uint32_t)i * 256 * gain100 / 100;
-    }
-}
-
-static int16_t speed_axis(int16_t v, int32_t *carry, int16_t rgain) {
-    int16_t a = v < 0 ? -v : v;
-    if (a > 127) a = 127;                    // 拡張レポートの大入力は上限で頭打ち（64bit回避＝省フラッシュ）
-    int32_t out256 = (int32_t)expo_lut[a] * SPEED_PCT / 100;   // 縮小係数を適用
-    out256 = out256 * rgain / 100;          // 動き始めランプ（初動スパイク抑制）
-    if (v < 0) out256 = -out256;
-    *carry += out256;                       // 端数を蓄積
-    int16_t whole = (int16_t)(*carry / 256);
-    *carry -= (int32_t)whole * 256;         // 端数を次回へ持ち越し
-    return whole;
-}
-
-report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
-    // ※OLEDの「Ball:」行 x/y はこの変換の"前"の値＝ほぼ生のセンサー移動量。実測に使える。
-    if (!keyball_get_scroll_mode()) {        // スクロール中はポインター曲線は適用しない（スクロールは純正）
-        int16_t rgain = 100;
-        if (mouse_report.x != 0 || mouse_report.y != 0) {
-            uint32_t now = timer_read32();
-            if (TIMER_DIFF_32(now, onset_last) > ONSET_GAP_MS) onset_start = now;  // 久々の動き=立上り開始
-            onset_last = now;
-            uint32_t since = TIMER_DIFF_32(now, onset_start);
-            if (since > ONSET_MS) since = ONSET_MS;
-            rgain = ONSET_MIN + (int32_t)(100 - ONSET_MIN) * since / ONSET_MS;
-        }
-        mouse_report.x = speed_axis(mouse_report.x, &carry_x, rgain);
-        mouse_report.y = speed_axis(mouse_report.y, &carry_y, rgain);
-    }
-    return mouse_report;
 }
 // ------------------------------------------------------------------------
 
