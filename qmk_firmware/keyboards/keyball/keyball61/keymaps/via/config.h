@@ -35,8 +35,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define TAP_CODE_DELAY 5
 
+// AML（自動マウスレイヤー）: ボールに触れると自動で Layer 2 へ切替
 #define POINTING_DEVICE_AUTO_MOUSE_ENABLE
 #define AUTO_MOUSE_DEFAULT_LAYER 2
-
-// 加速で大きくなった移動量が8bit(±127)で頭打ちにならないよう拡張レポートを使う
-#define MOUSE_EXTENDED_REPORT
