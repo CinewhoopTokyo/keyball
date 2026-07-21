@@ -27,7 +27,7 @@ enum custom_keycodes {
     CPI_PREC = KEYBALL_SAFE_RANGE,   // = QK_USER_0 = 0x7E40（Remap: USER00）
 };
 
-#define PRECISION_CPI 2              // 押下中のCPI（×100 → 2 = 200CPI）。1=100 / 3=300 で調整可
+#define PRECISION_CPI 4              // 押下中のCPI（×100 → 4 = 400CPI）。3=300 / 5=500 で調整可
 
 static uint8_t  saved_cpi   = 0;      // 精密モード前のCPI
 static bool     prec_active = false;  // 精密モード中か
