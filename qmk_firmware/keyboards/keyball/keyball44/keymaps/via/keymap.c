@@ -29,16 +29,36 @@ enum custom_keycodes {
 
 #define PRECISION_CPI 2              // 押下中のCPI（×100 → 2 = 200CPI）。1=100 / 3=300 で調整可
 
-static uint8_t saved_cpi = 0;
+static uint8_t  saved_cpi   = 0;      // 精密モード前のCPI
+static bool     prec_active = false;  // 精密モード中か
+static keypos_t prec_key;             // 押した「物理キー位置」を記憶
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    // --- 保険：精密モード中に「記憶した物理キー」が離されたら必ず復帰 ---
+    // AML等でレイヤーが変わると、離した時のキーコードが CPI_PREC 以外に解決され、
+    // 復帰処理が走らず低CPIのまま固着する。キーコードではなく物理位置で判定して防ぐ。
+    if (prec_active && !record->event.pressed
+        && record->event.key.row == prec_key.row
+        && record->event.key.col == prec_key.col) {
+        keyball_set_cpi(saved_cpi);
+        prec_active = false;
+        return false;
+    }
+
     switch (keycode) {
         case CPI_PREC:
             if (record->event.pressed) {
-                saved_cpi = keyball_get_cpi();   // 現在のCPIを退避
-                keyball_set_cpi(PRECISION_CPI);  // 精密モードへ
+                if (!prec_active) {                 // 二重押しで退避値を潰さない
+                    saved_cpi   = keyball_get_cpi();
+                    prec_key    = record->event.key;
+                    prec_active = true;
+                }
+                keyball_set_cpi(PRECISION_CPI);     // 精密モードへ
             } else {
-                keyball_set_cpi(saved_cpi);      // 離したら元のCPIへ復帰
+                if (prec_active) {
+                    keyball_set_cpi(saved_cpi);     // 離したら元のCPIへ復帰
+                    prec_active = false;
+                }
             }
             return false;
     }
