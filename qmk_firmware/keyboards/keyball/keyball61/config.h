@@ -60,7 +60,28 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #    endif
 #endif
 #ifdef RGB_MATRIX_ENABLE
-#    define RGB_MATRIX_SPLIT    { 37, 37 }
+#    define RGB_MATRIX_SPLIT        { 37, 37 }
+#    define RGB_MATRIX_LED_COUNT    74
+#    define SPLIT_TRANSPORT_MIRROR
+
+// 電力制限（USBバスパワー保護）
+#    define RGB_MATRIX_MAXIMUM_BRIGHTNESS 120
+
+// 押鍵反応エフェクトのみ有効化（ファームサイズ節約）
+#    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_SIMPLE
+#    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_WIDE
+#    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
+#    define ENABLE_RGB_MATRIX_SOLID_COLOR
+
+// 起動時の設定：普段は暗く、押すと周辺が明るくなる
+#    define RGB_MATRIX_DEFAULT_MODE RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
+#    define RGB_MATRIX_DEFAULT_HUE  170   // 青系
+#    define RGB_MATRIX_DEFAULT_SAT  255
+#    define RGB_MATRIX_DEFAULT_VAL  40    // 普段の明るさ（暗め）
+#    define RGB_MATRIX_DEFAULT_SPD  60    // 反応の減衰速度
+
+// タイピング中以外は消灯（省電力）
+#    define RGB_MATRIX_TIMEOUT 600000     // 10分無操作で消灯
 #endif
 
 #ifndef OLED_FONT_H

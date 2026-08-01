@@ -46,3 +46,7 @@ void keyball_on_adjust_layout(keyball_adjust_t v) {
     rgblight_set_effect_range(0, lednum_this + lednum_that);
 #endif
 }
+
+#ifdef RGB_MATRIX_ENABLE
+#    include "rgb_matrix_kb.inc"
+#endif
