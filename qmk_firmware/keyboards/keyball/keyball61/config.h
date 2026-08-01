@@ -67,20 +67,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // 電力制限（USBバスパワー保護）
 #    define RGB_MATRIX_MAXIMUM_BRIGHTNESS 120
 
-// 押鍵反応エフェクトのみ有効化（ファームサイズ節約）
-#    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
-// 他のエフェクトは無効（ファームサイズ節約）
-#    define DISABLE_RGB_MATRIX_ALPHAS_MODS
+// 押鍵反応を使うために必要
+#    define RGB_MATRIX_KEYREACTIVE_ENABLED
+#    define RGB_MATRIX_KEYPRESSES
 
-// 起動時の設定：普段は暗く、押すと周辺が明るくなる
-#    define RGB_MATRIX_DEFAULT_MODE RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
+// 標準エフェクトは全て無効（サイズ節約）。カスタムのみ使う
+#    define RGB_MATRIX_CUSTOM_USER
+
+// カスタムエフェクト GLOW_REACTIVE のパラメータ
+#    define GLOW_BASE_VAL   25    // 常時点灯の明るさ
+#    define GLOW_HIT_BOOST  200   // 押鍵時の上乗せ
+#    define GLOW_SPREAD     60    // 光が広がる距離
+
+// 起動時の設定
+#    define RGB_MATRIX_DEFAULT_MODE RGB_MATRIX_CUSTOM_GLOW_REACTIVE
 #    define RGB_MATRIX_DEFAULT_HUE  170   // 青系
 #    define RGB_MATRIX_DEFAULT_SAT  255
-#    define RGB_MATRIX_DEFAULT_VAL  40    // 普段の明るさ（暗め）
-#    define RGB_MATRIX_DEFAULT_SPD  60    // 反応の減衰速度
+#    define RGB_MATRIX_DEFAULT_VAL  120   // 押鍵時の最大輝度
+#    define RGB_MATRIX_DEFAULT_SPD  90    // 減衰速度（大きいほど速く戻る）
 
-// タイピング中以外は消灯（省電力）
-#    define RGB_MATRIX_TIMEOUT 600000     // 10分無操作で消灯
+// 無操作での消灯はしない（常時点灯させるため）
 #endif
 
 #ifndef OLED_FONT_H

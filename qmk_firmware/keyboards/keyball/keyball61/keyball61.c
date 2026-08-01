@@ -48,5 +48,5 @@ void keyball_on_adjust_layout(keyball_adjust_t v) {
 }
 
 #ifdef RGB_MATRIX_ENABLE
-#    include "rgb_matrix_kb.inc"
+#    include "led_config.inc"
 #endif
