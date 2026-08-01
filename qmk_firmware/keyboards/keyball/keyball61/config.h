@@ -68,10 +68,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #    define RGB_MATRIX_MAXIMUM_BRIGHTNESS 120
 
 // 押鍵反応エフェクトのみ有効化（ファームサイズ節約）
-#    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_SIMPLE
-#    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_WIDE
 #    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
-#    define ENABLE_RGB_MATRIX_SOLID_COLOR
+// 他のエフェクトは無効（ファームサイズ節約）
+#    define DISABLE_RGB_MATRIX_ALPHAS_MODS
 
 // 起動時の設定：普段は暗く、押すと周辺が明るくなる
 #    define RGB_MATRIX_DEFAULT_MODE RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
