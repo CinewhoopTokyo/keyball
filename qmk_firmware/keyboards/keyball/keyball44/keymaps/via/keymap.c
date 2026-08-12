@@ -20,50 +20,98 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "quantum.h"
 
-// --- 押下中だけ低CPI（精密モード / サニパー） --------------------------------
-// Remapで USER00 (0x7E40) を好きなキーに割り当てて使う。押している間だけ低CPI、
-// 離すと元のCPIに戻る（現在CPIを退避するので普段CPIを上げていてもOK）。
+// --- 状態をPCへ送る（OLEDエミュレータ用） ----------------------------------
+// 実機にOLEDを付けていないので、OLEDに出るはずの情報を Raw HID で PC へ流す。
+// VIA_ENABLE=yes により RAW_ENABLE も有効なので、送る口は既にある。
+//
+// 受け側: ClaudeCode/keyball/tools/pointermon
+//
+// 注意: Remap(WebHID) を開いたままだと Raw HID の取り合いになる。同時に使わないこと。
+//       止めたいときは KBSTAT_TG（Remap: USER00 / 0x7E40）を任意のキーに割り当てて押す。
+#ifdef RAW_ENABLE
+#    include "raw_hid.h"
+#    include <string.h>
+
+#    ifndef RAW_EPSIZE
+#        define RAW_EPSIZE 32
+#    endif
+
 enum custom_keycodes {
-    CPI_PREC = KEYBALL_SAFE_RANGE,   // = QK_USER_0 = 0x7E40（Remap: USER00）
+    KBSTAT_TG = KEYBALL_SAFE_RANGE,   // 送信の入/切  = QK_USER_0 = 0x7E40（Remap: USER00）
 };
 
-#define PRECISION_CPI 4              // 押下中のCPI（×100 → 4 = 400CPI）。3=300 / 5=500 で調整可
+#    define KBSTAT_MAGIC    0xB5
+#    define KBSTAT_VERSION  1
+#    define KBSTAT_INTERVAL 100        // 送信間隔[ms]
 
-static uint8_t  saved_cpi   = 0;      // 精密モード前のCPI
-static bool     prec_active = false;  // 精密モード中か
-static keypos_t prec_key;             // 押した「物理キー位置」を記憶
+static bool     kbstat_enable = true;
+static uint32_t kbstat_last   = 0;
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
-    // --- 保険：精密モード中に「記憶した物理キー」が離されたら必ず復帰 ---
-    // AML等でレイヤーが変わると、離した時のキーコードが CPI_PREC 以外に解決され、
-    // 復帰処理が走らず低CPIのまま固着する。キーコードではなく物理位置で判定して防ぐ。
-    if (prec_active && !record->event.pressed
-        && record->event.key.row == prec_key.row
-        && record->event.key.col == prec_key.col) {
-        keyball_set_cpi(saved_cpi);
-        prec_active = false;
+    if (keycode == KBSTAT_TG) {
+        if (record->event.pressed) kbstat_enable = !kbstat_enable;
         return false;
-    }
-
-    switch (keycode) {
-        case CPI_PREC:
-            if (record->event.pressed) {
-                if (!prec_active) {                 // 二重押しで退避値を潰さない
-                    saved_cpi   = keyball_get_cpi();
-                    prec_key    = record->event.key;
-                    prec_active = true;
-                }
-                keyball_set_cpi(PRECISION_CPI);     // 精密モードへ
-            } else {
-                if (prec_active) {
-                    keyball_set_cpi(saved_cpi);     // 離したら元のCPIへ復帰
-                    prec_active = false;
-                }
-            }
-            return false;
     }
     return true;
 }
+
+static void kbstat_send(void) {
+    uint8_t b[RAW_EPSIZE];
+    memset(b, 0, sizeof(b));
+
+    b[0] = KBSTAT_MAGIC;
+    b[1] = KBSTAT_VERSION;
+
+    b[2] = keyball_get_cpi();                    // 実CPI = この値 × 100
+    b[3] = keyball_get_scroll_div();
+    b[4] = keyball_get_scroll_mode() ? 0x01 : 0x00;
+#    if KEYBALL_SCROLLSNAP_ENABLE == 2
+    // 0 = スナップ機能なし、1..3 = VERTICAL / HORIZONTAL / FREE
+    b[4] |= (uint8_t)((keyball_get_scrollsnap_mode() + 1) << 1);
+#    endif
+
+    uint32_t ls = layer_state;
+    b[5] = (uint8_t)(ls);
+    b[6] = (uint8_t)(ls >> 8);
+    b[7] = (uint8_t)(ls >> 16);
+    b[8] = (uint8_t)(ls >> 24);
+
+    // MOUSE_EXTENDED_REPORT の有無で x/y の型が変わるので、必ず int16 に広げてから詰める
+    int16_t mx = (int16_t)keyball.last_mouse.x;
+    int16_t my = (int16_t)keyball.last_mouse.y;
+    b[9]  = (uint8_t)(mx);
+    b[10] = (uint8_t)(mx >> 8);
+    b[11] = (uint8_t)(my);
+    b[12] = (uint8_t)(my >> 8);
+    b[13] = (uint8_t)(keyball.last_mouse.h);
+    b[14] = (uint8_t)(keyball.last_mouse.v);
+
+#    ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+    b[15] = get_auto_mouse_enable() ? 1 : 0;
+    uint16_t amt = get_auto_mouse_timeout();
+    b[16] = (uint8_t)(amt);
+    b[17] = (uint8_t)(amt >> 8);
+#    endif
+
+    b[18] = keyball.last_pos.row;
+    b[19] = keyball.last_pos.col;
+    b[20] = (uint8_t)(keyball.last_kc);
+    b[21] = (uint8_t)(keyball.last_kc >> 8);
+    b[22] = keyball.this_have_ball ? 1 : 0;
+    b[23] = keyball.that_have_ball ? 1 : 0;
+
+    raw_hid_send(b, sizeof(b));
+}
+
+void housekeeping_task_user(void) {
+    // 送るのはUSBに繋がっている側だけ。従側は raw_hid を持たない。
+    if (!kbstat_enable || !is_keyboard_master()) return;
+    uint32_t now = timer_read32();
+    if (TIMER_DIFF_32(now, kbstat_last) < KBSTAT_INTERVAL) return;
+    kbstat_last = now;
+    kbstat_send();
+}
+#endif  // RAW_ENABLE
 // --------------------------------------------------------------------------
 
 // clang-format off
