@@ -20,46 +20,28 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "quantum.h"
 
-// --- 状態をPCへ送る（OLEDエミュレータ用） ----------------------------------
-// 実機にOLEDを付けていないので、OLEDに出るはずの情報を Raw HID で PC へ流す。
-// VIA_ENABLE=yes により RAW_ENABLE も有効なので、送る口は既にある。
+// --- 状態をPCへ返す（OLEDエミュレータ用） ----------------------------------
+// 実機にOLEDを付けていないので、OLEDに出るはずの情報を Raw HID で PC へ返す。
+//
+// ★勝手に送らない。PCから要求されたときだけ返す。
+//   最初は100msごとに送りつける実装にしたが、Remap(WebHID)は
+//   「コマンドを送って返事を待つ」方式のため、こちらの無関係なパケットを
+//   返事と誤解して接続できなくなった。要求応答にすれば干渉しない。
 //
 // 受け側: ClaudeCode/keyball/tools/pointermon
-//
-// 注意: Remap(WebHID) を開いたままだと Raw HID の取り合いになる。同時に使わないこと。
-//       止めたいときは KBSTAT_TG（Remap: USER00 / 0x7E40）を任意のキーに割り当てて押す。
-#ifdef RAW_ENABLE
+#if defined(RAW_ENABLE) && defined(VIA_ENABLE)
 #    include "raw_hid.h"
+#    include "via.h"
 #    include <string.h>
 
-#    ifndef RAW_EPSIZE
-#        define RAW_EPSIZE 32
-#    endif
+// VIAのコマンドIDは 0x00〜0x0E 付近と 0xFF。衝突しない値を選ぶ。
+#    define KBSTAT_CMD     0xB5
+#    define KBSTAT_VERSION 2
 
-enum custom_keycodes {
-    KBSTAT_TG = KEYBALL_SAFE_RANGE,   // 送信の入/切  = QK_USER_0 = 0x7E40（Remap: USER00）
-};
+static void kbstat_fill(uint8_t *b, uint8_t len) {
+    memset(b, 0, len);
 
-#    define KBSTAT_MAGIC    0xB5
-#    define KBSTAT_VERSION  1
-#    define KBSTAT_INTERVAL 100        // 送信間隔[ms]
-
-static bool     kbstat_enable = true;
-static uint32_t kbstat_last   = 0;
-
-bool process_record_user(uint16_t keycode, keyrecord_t *record) {
-    if (keycode == KBSTAT_TG) {
-        if (record->event.pressed) kbstat_enable = !kbstat_enable;
-        return false;
-    }
-    return true;
-}
-
-static void kbstat_send(void) {
-    uint8_t b[RAW_EPSIZE];
-    memset(b, 0, sizeof(b));
-
-    b[0] = KBSTAT_MAGIC;
+    b[0] = KBSTAT_CMD;
     b[1] = KBSTAT_VERSION;
 
     b[2] = keyball_get_cpi();                    // 実CPI = この値 × 100
@@ -99,19 +81,19 @@ static void kbstat_send(void) {
     b[21] = (uint8_t)(keyball.last_kc >> 8);
     b[22] = keyball.this_have_ball ? 1 : 0;
     b[23] = keyball.that_have_ball ? 1 : 0;
-
-    raw_hid_send(b, sizeof(b));
 }
 
-void housekeeping_task_user(void) {
-    // 送るのはUSBに繋がっている側だけ。従側は raw_hid を持たない。
-    if (!kbstat_enable || !is_keyboard_master()) return;
-    uint32_t now = timer_read32();
-    if (TIMER_DIFF_32(now, kbstat_last) < KBSTAT_INTERVAL) return;
-    kbstat_last = now;
-    kbstat_send();
+// VIAが自前で処理する前に呼ばれる。true を返すとVIAの処理を止める。
+// 自分のコマンド以外は false を返し、Remapの動作を一切邪魔しない。
+bool via_command_kb(uint8_t *data, uint8_t length) {
+    if (length > 0 && data[0] == KBSTAT_CMD) {
+        kbstat_fill(data, length);
+        raw_hid_send(data, length);
+        return true;
+    }
+    return false;
 }
-#endif  // RAW_ENABLE
+#endif  // RAW_ENABLE && VIA_ENABLE
 // --------------------------------------------------------------------------
 
 // clang-format off
