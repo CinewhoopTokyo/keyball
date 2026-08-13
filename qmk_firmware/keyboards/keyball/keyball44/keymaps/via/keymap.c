@@ -37,7 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // VIAのコマンドIDは 0x00〜0x0E 付近と 0xFF。衝突しない値を選ぶ。
 #    define KBSTAT_CMD     0xB5
 #    define INRT_CMD       0xB6   // 慣性の調整値の読み書き
-#    define KBSTAT_VERSION 7   // 7: 空転と慣性を重ねる方式に変更（段差解消・掴んで停止）
+#    define KBSTAT_VERSION 8   // 8: スクロールを均してから渡す（掴み検出の誤爆を修正）
 
 #    ifdef POINTING_DEVICE_ENABLE
 bool keyball_inertia_is_enabled(void);            // 実体は下の「トラックボールの慣性」ブロック
@@ -154,13 +154,12 @@ static uint8_t inrt_kick       = 250; // 引き継ぐ割合 /256。256に近い�
 static uint8_t inrt_decay      = 238; // 減衰 /256。238≒0.930
 static uint8_t inrt_scrl_peak  = 25;  // スクロール: 0.25段/コマ
 static uint8_t inrt_scrl_kick  = 250;
-static uint8_t inrt_scrl_decay = 246;
+static uint8_t inrt_scrl_decay = 250;  // 250≒0.977。246だと約7段と物足りなかった
 static bool    inrt_enabled    = true;
 
 // 掴んで止めたと判定する、直前のボール速度。これ未満から0になっただけなら
 // 自然に回り終わっただけとみなす。
 #    define INRT_GRAB      (3 * INRT_ONE)
-#    define INRT_SCRL_GRAB (INRT_ONE / 4)
 
 typedef struct {
     int32_t cx, cy;    // 慣性の速度。これを出す
@@ -172,6 +171,9 @@ typedef struct {
 static inrt_t inrt_move, inrt_scrl;
 static uint32_t inrt_last = 0;
 
+// スクロールを均すための入れ物。理由は使う場所のコメント参照。
+static int32_t inrt_scrl_rate_x = 0, inrt_scrl_rate_y = 0;
+
 static void inrt_reset(inrt_t *s) {
     s->cx = s->cy = s->rx = s->ry = s->lastMag = 0;
     s->armed = false;
@@ -182,6 +184,7 @@ bool keyball_inertia_is_enabled(void) { return inrt_enabled; }
 static void inrt_stop_all(void) {
     inrt_reset(&inrt_move);
     inrt_reset(&inrt_scrl);
+    inrt_scrl_rate_x = inrt_scrl_rate_y = 0;
 }
 
 /// 1コマ分の処理。ボールの値 (bx,by) を受け取り、出す値を (*ox,*oy) に返す。
@@ -262,10 +265,20 @@ report_mouse_t pointing_device_task_user(report_mouse_t r) {
 
     int8_t ox = 0, oy = 0;
     if (scroll) {
-        if (inrt_run(&inrt_scrl, (int32_t)r.h << INRT_SHIFT, (int32_t)r.v << INRT_SHIFT,
+        // ★ 分周後の値は 0 か 1 しか出ない。飛び飛びなので、そのまま速度として
+        //   渡すと「段が出ないコマ」が毎回“急に0になった＝掴まれた”に見えて、
+        //   滑走が始まった次のコマで必ず打ち切られる。実際そうなっていた。
+        //   「1コマあたり何段出たか」に均してから渡す。0のコマも入れるのが肝で、
+        //   出たコマだけ平均するとゆっくり回しても弾いても同じ 1 になる。
+        //   時定数は16コマ≒128ms。
+        inrt_scrl_rate_x = (inrt_scrl_rate_x * 15 + ((int32_t)r.h << INRT_SHIFT)) / 16;
+        inrt_scrl_rate_y = (inrt_scrl_rate_y * 15 + ((int32_t)r.v << INRT_SHIFT)) / 16;
+        // 均した値は急に0にならないので、掴み検出は使えない（しきい値を届かない値に）。
+        // スクロールの滑走は0.5秒ほどで自然に止まる。途中で止めたいならキーを押す。
+        if (inrt_run(&inrt_scrl, inrt_scrl_rate_x, inrt_scrl_rate_y,
                      ((int32_t)inrt_scrl_peak * INRT_ONE) / 100,
                      inrt_scrl_kick, inrt_scrl_decay,
-                     INRT_ONE / 16, INRT_SCRL_GRAB, &ox, &oy)) {
+                     INRT_ONE / 16, 0x7FFFFFFFL, &ox, &oy)) {
             r.h = ox;
             r.v = oy;
         }
