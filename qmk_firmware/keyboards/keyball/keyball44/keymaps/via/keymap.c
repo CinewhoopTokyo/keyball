@@ -36,7 +36,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // VIAのコマンドIDは 0x00〜0x0E 付近と 0xFF。衝突しない値を選ぶ。
 #    define KBSTAT_CMD     0xB5
-#    define KBSTAT_VERSION 2
+#    define KBSTAT_VERSION 3   // 3: b[24] に慣性のON/OFFを追加
+
+#    ifdef POINTING_DEVICE_ENABLE
+bool keyball_inertia_is_enabled(void);   // 実体は下の「トラックボールの慣性」ブロック
+#    endif
 
 static void kbstat_fill(uint8_t *b, uint8_t len) {
     memset(b, 0, len);
@@ -81,6 +85,11 @@ static void kbstat_fill(uint8_t *b, uint8_t len) {
     b[21] = (uint8_t)(keyball.last_kc >> 8);
     b[22] = keyball.this_have_ball ? 1 : 0;
     b[23] = keyball.that_have_ball ? 1 : 0;
+#    ifdef POINTING_DEVICE_ENABLE
+    if (len > 24) {
+        b[24] = keyball_inertia_is_enabled() ? 1 : 0;
+    }
+#    endif
 }
 
 // VIAが自前で処理する前に呼ばれる。true を返すとVIAの処理を止める。
@@ -94,6 +103,203 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
     return false;
 }
 #endif  // RAW_ENABLE && VIA_ENABLE
+// --------------------------------------------------------------------------
+
+// --- トラックボールの慣性 --------------------------------------------------
+//
+// フリックしたあと滑る。ゆっくり動かしているときは滑らないので、
+// 精密な位置合わせは今までどおりできる。ポインタとスクロールの両方に効く。
+//
+// なぜ pointing_device_task_user() を使うか
+//   keyball_on_apply_motion_to_mouse_move() は「動きがあるとき」の変換用で、
+//   しかも自分側/相手側で2回呼ばれてレポートを上書きし合う。
+//   慣性は「動きが無いtick」にも値を出す必要があるので使えない。
+//   pointing_device_task_user() なら最終レポートを1回だけ触れる。
+//   keyball 側は pointing_device_task_kb() を上書きしていないので素通しで届く。
+//
+// なぜ固定小数点か
+//   ATmega32U4 に FPU が無い。速度を 1/256 単位の整数で持つ。
+//
+// なぜ時間で駆動するか
+//   pointing_device_task の呼ばれる間隔は環境で変わる。tick数で減衰させると
+//   滑り方が状況で変わってしまう。keyball のレポート間隔と同じ 8ms(125Hz)で
+//   1コマ進める。
+
+#ifdef POINTING_DEVICE_ENABLE
+
+#    include <stdlib.h>   // labs()。quantum.h 経由で入る保証が無いので明示する
+
+#    define INRT_SHIFT   8                  // 1.0 = 256
+#    define INRT_ONE     (1L << INRT_SHIFT)
+#    define INRT_TICK_MS KEYBALL_REPORTMOUSE_INTERVAL  // 8ms
+#    define INRT_DECAY   246                // 246/256 ≒ 0.961 /コマ。約0.7秒で止まる
+
+// ポインタ用。CPI700での移動量は普段 2〜16、強く弾くと40前後（pointermon実測）。
+// 18 にすると「普段の速さで動かして止めた」では滑らず、意図して弾いたときだけ滑る。
+// 机上シミュレーションでの滑走距離: ピーク24→558カウント / ピーク40→950カウント。
+#    define INRT_MOVE_MIN  (18 * INRT_ONE)  // これ未満の速度では滑らせない
+#    define INRT_MOVE_STOP (1 * INRT_ONE)
+
+// スクロール用。単位は「1コマあたり何段出たか」。0.60段/tick 以上で滑らせる。
+// DIV6(÷32)ならボール20カウント/レポートあたりが境目。
+// 滑走はボール20→7段 / 28→13段 / 44→24段。
+#    define INRT_SCRL_MIN  ((60 * INRT_ONE) / 100)
+#    define INRT_SCRL_STOP (INRT_ONE / 4)
+
+typedef struct {
+    int32_t vx, vy;   // 速度
+    int32_t rx, ry;   // 整数に落とし切れなかった端数の持ち越し
+    bool    coasting;
+} inrt_t;
+
+static inrt_t   inrt_move, inrt_scrl;
+static uint32_t inrt_last    = 0;
+static bool     inrt_enabled = true;
+
+static void inrt_reset(inrt_t *s) {
+    s->vx = s->vy = s->rx = s->ry = 0;
+    s->coasting = false;
+}
+
+bool keyball_inertia_is_enabled(void) {
+    return inrt_enabled;
+}
+
+static void inrt_stop_all(void) {
+    inrt_reset(&inrt_move);
+    inrt_reset(&inrt_scrl);
+}
+
+/// ポインタ用。入力がある間は速度を追いかける。
+///
+/// 重みは 1/2。1/4 にすると追従が遅く、5レポート分のフリックで入力の76%までしか
+/// 上がらなかった（机上で確認）。1/2 なら立ち上がりが速いだけでなく、
+/// 「狙って減速して止める」ときに速度も素早く落ちるので、
+/// 精密に止めたつもりが滑り出す事故が起きない。
+/// 実際、ピーク40から4レポート(32ms)減速するだけで滑走はキャンセルされる。
+static void inrt_track(inrt_t *s, int16_t dx, int16_t dy) {
+    s->vx = (s->vx + ((int32_t)dx << INRT_SHIFT)) / 2;
+    s->vy = (s->vy + ((int32_t)dy << INRT_SHIFT)) / 2;
+    s->coasting = false;
+    s->rx = s->ry = 0;
+}
+
+/// スクロール用。「1コマあたり何段出たか」の割合を測る。
+///
+/// ★ 段が出なかったコマ（0）も必ず入れること。
+///   分周後の値は 0 か 1 しか出ないので、出たコマだけ平均すると
+///   ゆっくり回しても弾いても同じ 1 になり、区別できなくなる。
+///   時定数は 16コマ ≒ 128ms。
+static int32_t inrt_rate(int32_t v, int8_t n) {
+    return (v * 15 + ((int32_t)n << INRT_SHIFT)) / 16;
+}
+
+/// 滑走を1コマ進める。出す量を *ox,*oy に返す。まだ滑るなら true。
+static bool inrt_step(inrt_t *s, int32_t start_min, int32_t stop_at, int8_t *ox, int8_t *oy) {
+    if (!s->coasting) {
+        // 滑り出しの判定。ゆっくり動かして止めただけなら滑らせない
+        if (!inrt_enabled || labs(s->vx) + labs(s->vy) < start_min) {
+            inrt_reset(s);
+            return false;
+        }
+        s->coasting = true;
+    }
+    s->vx = (s->vx * INRT_DECAY) >> INRT_SHIFT;
+    s->vy = (s->vy * INRT_DECAY) >> INRT_SHIFT;
+    if (labs(s->vx) + labs(s->vy) < stop_at) {
+        inrt_reset(s);
+        return false;
+    }
+    s->rx += s->vx;
+    s->ry += s->vy;
+    // 負数の算術右シフトは床関数になる。端数を引き戻すので誤差は溜まらない。
+    int32_t px = s->rx >> INRT_SHIFT;
+    int32_t py = s->ry >> INRT_SHIFT;
+    s->rx -= px << INRT_SHIFT;
+    s->ry -= py << INRT_SHIFT;
+    // MOUSE_EXTENDED_REPORT は無効なので int8 に収める
+    *ox = px > 127 ? 127 : (px < -127 ? -127 : (int8_t)px);
+    *oy = py > 127 ? 127 : (py < -127 ? -127 : (int8_t)py);
+    return true;
+}
+
+report_mouse_t pointing_device_task_user(report_mouse_t r) {
+    bool scroll = keyball_get_scroll_mode();
+
+    // モードが変わったら滑走は打ち切る。x/y と h/v をまたいで滑らせない
+    static bool last_scroll = false;
+    if (scroll != last_scroll) {
+        last_scroll = scroll;
+        inrt_stop_all();
+    }
+
+    // ボタンを押している間は滑らせない。ドラッグ中に勝手に動くと困る
+    if (r.buttons) {
+        inrt_stop_all();
+        return r;
+    }
+
+    // ★ 8ms のコマ送り。動きがあったコマは必ず処理し、無かったコマは
+    //   前回から 8ms 経ってから処理する。
+    //   この関数は 1ms ごと（POINTING_DEVICE_TASK_THROTTLE_MS の既定）に呼ばれるが、
+    //   keyball はセンサ値を 8ms に1回しか出さない（KEYBALL_REPORTMOUSE_INTERVAL）。
+    //   その合間の「値が0のコマ」を指を離したと誤認すると、
+    //   ボールを動かしている最中に滑り出してしまう。
+    uint32_t now    = timer_read32();
+    bool     moving = scroll ? (r.h != 0 || r.v != 0) : (r.x != 0 || r.y != 0);
+    if (!moving && TIMER_DIFF_32(now, inrt_last) < INRT_TICK_MS) {
+        return r;
+    }
+    inrt_last = now;
+
+    int8_t ox = 0, oy = 0;
+
+    if (scroll) {
+        // 段が出なかったコマも割合に入れる（inrt_rate のコメント参照）。
+        // 滑走中は自分の出した値を食べ直さないよう更新しない。
+        if (!inrt_scrl.coasting) {
+            inrt_scrl.vx = inrt_rate(inrt_scrl.vx, r.h);
+            inrt_scrl.vy = inrt_rate(inrt_scrl.vy, r.v);
+        }
+        if (moving) {
+            inrt_scrl.coasting = false;
+            inrt_scrl.rx = inrt_scrl.ry = 0;
+            return r;
+        }
+        if (inrt_step(&inrt_scrl, INRT_SCRL_MIN, INRT_SCRL_STOP, &ox, &oy)) {
+            r.h = ox;
+            r.v = oy;
+        }
+        return r;
+    }
+
+    if (moving) {
+        inrt_track(&inrt_move, r.x, r.y);
+        return r;
+    }
+    if (inrt_step(&inrt_move, INRT_MOVE_MIN, INRT_MOVE_STOP, &ox, &oy)) {
+        r.x = ox;
+        r.y = oy;
+    }
+    return r;
+}
+
+// キーを押したら滑走は即やめる。惰性で動いている最中に打ち始めたときに
+// カーソルが逃げていくのを防ぐ。
+// QK_USER_0 は慣性のON/OFF。Remapでは "User 0" として割り当てられる。
+bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    if (record->event.pressed) {
+        if (keycode == QK_USER_0) {
+            inrt_enabled = !inrt_enabled;
+            inrt_stop_all();
+            return false;
+        }
+        inrt_stop_all();
+    }
+    return true;
+}
+
+#endif  // POINTING_DEVICE_ENABLE
 // --------------------------------------------------------------------------
 
 // clang-format off
