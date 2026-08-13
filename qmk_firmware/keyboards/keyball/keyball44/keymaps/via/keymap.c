@@ -37,7 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // VIAのコマンドIDは 0x00〜0x0E 付近と 0xFF。衝突しない値を選ぶ。
 #    define KBSTAT_CMD     0xB5
 #    define INRT_CMD       0xB6   // 慣性の調整値の読み書き
-#    define KBSTAT_VERSION 5   // 4: 0xB6で調整可  5: 触って止めたときの再発動を修正
+#    define KBSTAT_VERSION 6   // 5: 再発動を修正  6: スクロールを別パラメータに分離
 
 #    ifdef POINTING_DEVICE_ENABLE
 bool keyball_inertia_is_enabled(void);            // 実体は下の「トラックボールの慣性」ブロック
@@ -151,8 +151,13 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
 // ここから下は 0xB6 で書き換えられる。既定値は実測に基づく。
 static uint8_t inrt_peak_min  = 6;    // ポインタ: このピーク速度以上で滑らせる（実測: 小移動2 / フリック6〜17）
 static uint8_t inrt_kick      = 140;  // ピークの何割から滑り出すか（/256）0.55
-static uint8_t inrt_decay     = 246;  // 減衰 /256。246≒0.961。252は滑りすぎだった
-static uint8_t inrt_scrl_peak = 30;   // スクロール: ピーク 0.30段/tick 以上
+static uint8_t inrt_decay     = 240;  // 減衰 /256。240≒0.938。246でもまだ滑りすぎだった
+static uint8_t inrt_scrl_peak = 25;   // スクロール: ピーク 0.25段/tick 以上
+// ★ スクロールはポインタと桁が違う。分周後の速度は 0.3〜0.5段/コマしかない。
+//   ポインタと同じ kick/decay/停止しきい値を使うと、滑り出す前に
+//   停止条件（0.5）を満たしてしまい、一度も動かない。実際そうなっていた。
+static uint8_t inrt_scrl_kick  = 220; // スクロールの滑り出し /256
+static uint8_t inrt_scrl_decay = 249; // スクロールの減衰 /256
 static bool    inrt_enabled   = true;
 
 // ピークを忘れる速さ。指を離してから空転が終わるまで覚えていられる長さにする。
@@ -226,7 +231,8 @@ static void inrt_rate(inrt_t *s, int8_t h, int8_t v) {
 }
 
 /// 滑走を1コマ進める。出す量を *ox,*oy に返す。まだ滑るなら true。
-static bool inrt_step(inrt_t *s, int32_t peak_min, int8_t *ox, int8_t *oy) {
+static bool inrt_step(inrt_t *s, int32_t peak_min, uint8_t kick, uint8_t decay,
+                      int32_t stop_at, int8_t *ox, int8_t *oy) {
     if (!s->coasting) {
         // ★ 止まった瞬間の速度ではなくピークで判定する。
         //   空転で 1 まで落ちていても、直前に速ければ滑らせる。
@@ -236,17 +242,17 @@ static bool inrt_step(inrt_t *s, int32_t peak_min, int8_t *ox, int8_t *oy) {
         }
         // ピークの何割かから始める。ボールの空転が終わったところを引き継ぐので、
         // ピークそのままだと速すぎて跳ねて見える。
-        s->vx = (s->px * inrt_kick) >> INRT_SHIFT;
-        s->vy = (s->py * inrt_kick) >> INRT_SHIFT;
+        s->vx = (s->px * kick) >> INRT_SHIFT;
+        s->vy = (s->py * kick) >> INRT_SHIFT;
         s->rx = s->ry = 0;
         s->coasting = true;
         // ピークは使い切る。1回の弾きで滑るのは1回だけ。
         s->peak = 0;
         s->px = s->py = 0;
     }
-    s->vx = (s->vx * inrt_decay) >> INRT_SHIFT;
-    s->vy = (s->vy * inrt_decay) >> INRT_SHIFT;
-    if (labs(s->vx) + labs(s->vy) < INRT_ONE / 2) {
+    s->vx = (s->vx * decay) >> INRT_SHIFT;
+    s->vy = (s->vy * decay) >> INRT_SHIFT;
+    if (labs(s->vx) + labs(s->vy) < stop_at) {
         inrt_reset(s);
         return false;
     }
@@ -303,7 +309,9 @@ report_mouse_t pointing_device_task_user(report_mouse_t r) {
             inrt_scrl.rx = inrt_scrl.ry = 0;
             return r;
         }
-        if (inrt_step(&inrt_scrl, ((int32_t)inrt_scrl_peak * INRT_ONE) / 100, &ox, &oy)) {
+        // 停止しきい値もスクロール用に下げる。ここが 0.5 のままだと一度も動かない。
+        if (inrt_step(&inrt_scrl, ((int32_t)inrt_scrl_peak * INRT_ONE) / 100,
+                      inrt_scrl_kick, inrt_scrl_decay, INRT_ONE / 16, &ox, &oy)) {
             r.h = ox;
             r.v = oy;
         }
@@ -314,7 +322,8 @@ report_mouse_t pointing_device_task_user(report_mouse_t r) {
         inrt_track(&inrt_move, r.x, r.y);
         return r;
     }
-    if (inrt_step(&inrt_move, (int32_t)inrt_peak_min * INRT_ONE, &ox, &oy)) {
+    if (inrt_step(&inrt_move, (int32_t)inrt_peak_min * INRT_ONE,
+                  inrt_kick, inrt_decay, INRT_ONE / 2, &ox, &oy)) {
         r.x = ox;
         r.y = oy;
     }
@@ -338,9 +347,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 
 /// 0xB6 で調整値を読み書きする。実機でしか詰められない値なので、
 /// 焼き直さずに変えられるようにしてある。RAMのみ＝電源を切ると既定に戻る。
-///   要求: B6 00                      → 現在値を返す
-///        B6 01 <peak> <kick> <decay> <scrlPeak> <enabled>
-/// 返事: B6 <peak> <kick> <decay> <scrlPeak> <enabled>
+///   要求: B6 00  → 現在値を返す
+///        B6 01 <peak> <kick> <decay> <scrlPeak> <enabled> <scrlKick> <scrlDecay>
+///        （0 は「変えない」の意味）
+/// 返事: B6 <peak> <kick> <decay> <scrlPeak> <enabled> <scrlKick> <scrlDecay>
 void keyball_inertia_command(uint8_t *d, uint8_t len) {
     if (len >= 7 && d[1] == 1) {
         if (d[2] > 0) inrt_peak_min = d[2];
@@ -348,6 +358,10 @@ void keyball_inertia_command(uint8_t *d, uint8_t len) {
         if (d[4] > 0) inrt_decay    = d[4] < 255 ? d[4] : 254;  // 255だと減衰しない
         if (d[5] > 0) inrt_scrl_peak = d[5];
         inrt_enabled = d[6] != 0;
+        if (len >= 9) {
+            if (d[7] > 0) inrt_scrl_kick  = d[7];
+            if (d[8] > 0) inrt_scrl_decay = d[8] < 255 ? d[8] : 254;
+        }
         inrt_stop_all();
     }
     d[0] = 0xB6;
@@ -356,7 +370,9 @@ void keyball_inertia_command(uint8_t *d, uint8_t len) {
     d[3] = inrt_decay;
     d[4] = inrt_scrl_peak;
     d[5] = inrt_enabled ? 1 : 0;
-    for (uint8_t i = 6; i < len; i++) d[i] = 0;
+    d[6] = inrt_scrl_kick;
+    d[7] = inrt_scrl_decay;
+    for (uint8_t i = 8; i < len; i++) d[i] = 0;
 }
 
 #endif  // POINTING_DEVICE_ENABLE
