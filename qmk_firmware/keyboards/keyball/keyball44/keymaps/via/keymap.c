@@ -37,7 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // VIAのコマンドIDは 0x00〜0x0E 付近と 0xFF。衝突しない値を選ぶ。
 #    define KBSTAT_CMD     0xB5
 #    define INRT_CMD       0xB6   // 慣性の調整値の読み書き
-#    define KBSTAT_VERSION 4   // 3: b[24]に慣性ON/OFF  4: 0xB6でピーク方式の調整可
+#    define KBSTAT_VERSION 5   // 4: 0xB6で調整可  5: 触って止めたときの再発動を修正
 
 #    ifdef POINTING_DEVICE_ENABLE
 bool keyball_inertia_is_enabled(void);            // 実体は下の「トラックボールの慣性」ブロック
@@ -149,9 +149,9 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
 #    define INRT_TICK_MS KEYBALL_REPORTMOUSE_INTERVAL  // 8ms
 
 // ここから下は 0xB6 で書き換えられる。既定値は実測に基づく。
-static uint8_t inrt_peak_min  = 9;    // ポインタ: このピーク速度以上で滑らせる
-static uint8_t inrt_kick      = 140;  // ピークの何割から滑り出すか（/256）
-static uint8_t inrt_decay     = 249;  // 減衰 /256。249≒0.973
+static uint8_t inrt_peak_min  = 6;    // ポインタ: このピーク速度以上で滑らせる（実測: 小移動2 / フリック6〜17）
+static uint8_t inrt_kick      = 140;  // ピークの何割から滑り出すか（/256）0.55
+static uint8_t inrt_decay     = 246;  // 減衰 /256。246≒0.961。252は滑りすぎだった
 static uint8_t inrt_scrl_peak = 30;   // スクロール: ピーク 0.30段/tick 以上
 static bool    inrt_enabled   = true;
 
@@ -200,6 +200,12 @@ static void inrt_peak_update(inrt_t *s) {
 
 /// ポインタ用。重み1/2。減速にも素早く追従する。
 static void inrt_track(inrt_t *s, int16_t dx, int16_t dy) {
+    // ★ 滑走中にボールが動いた＝利用者が掴んで止めにきた。
+    //   ここでピークごと捨てないと、手を離した瞬間に同じピークで
+    //   また滑り出して「止めても止まらない」ことになる。実際そうなった。
+    if (s->coasting) {
+        inrt_reset(s);
+    }
     s->vx = (s->vx + ((int32_t)dx << INRT_SHIFT)) / 2;
     s->vy = (s->vy + ((int32_t)dy << INRT_SHIFT)) / 2;
     inrt_peak_update(s);
@@ -211,6 +217,9 @@ static void inrt_track(inrt_t *s, int16_t dx, int16_t dy) {
 /// ★ 段が出なかったコマ（0）も必ず入れること。分周後は0か1しか出ないので、
 ///   出たコマだけ平均するとゆっくり回しても弾いても同じ1になる。
 static void inrt_rate(inrt_t *s, int8_t h, int8_t v) {
+    if (s->coasting && (h != 0 || v != 0)) {
+        inrt_reset(s);   // 滑走中に触られたら捨てる（inrt_track と同じ理由）
+    }
     s->vx = (s->vx * 15 + ((int32_t)h << INRT_SHIFT)) / 16;
     s->vy = (s->vy * 15 + ((int32_t)v << INRT_SHIFT)) / 16;
     inrt_peak_update(s);
@@ -231,6 +240,9 @@ static bool inrt_step(inrt_t *s, int32_t peak_min, int8_t *ox, int8_t *oy) {
         s->vy = (s->py * inrt_kick) >> INRT_SHIFT;
         s->rx = s->ry = 0;
         s->coasting = true;
+        // ピークは使い切る。1回の弾きで滑るのは1回だけ。
+        s->peak = 0;
+        s->px = s->py = 0;
     }
     s->vx = (s->vx * inrt_decay) >> INRT_SHIFT;
     s->vy = (s->vy * inrt_decay) >> INRT_SHIFT;
