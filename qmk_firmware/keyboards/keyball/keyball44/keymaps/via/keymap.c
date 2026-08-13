@@ -37,7 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // VIAのコマンドIDは 0x00〜0x0E 付近と 0xFF。衝突しない値を選ぶ。
 #    define KBSTAT_CMD     0xB5
 #    define INRT_CMD       0xB6   // 慣性の調整値の読み書き
-#    define KBSTAT_VERSION 6   // 5: 再発動を修正  6: スクロールを別パラメータに分離
+#    define KBSTAT_VERSION 7   // 7: 空転と慣性を重ねる方式に変更（段差解消・掴んで停止）
 
 #    ifdef POINTING_DEVICE_ENABLE
 bool keyball_inertia_is_enabled(void);            // 実体は下の「トラックボールの慣性」ブロック
@@ -144,126 +144,95 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
 
 #    include <stdlib.h>   // labs()。quantum.h 経由で入る保証が無いので明示する
 
-#    define INRT_SHIFT   8                  // 1.0 = 256
+#    define INRT_SHIFT   8
 #    define INRT_ONE     (1L << INRT_SHIFT)
 #    define INRT_TICK_MS KEYBALL_REPORTMOUSE_INTERVAL  // 8ms
 
-// ここから下は 0xB6 で書き換えられる。既定値は実測に基づく。
-static uint8_t inrt_peak_min  = 6;    // ポインタ: このピーク速度以上で滑らせる（実測: 小移動2 / フリック6〜17）
-static uint8_t inrt_kick      = 140;  // ピークの何割から滑り出すか（/256）0.55
-static uint8_t inrt_decay     = 240;  // 減衰 /256。240≒0.938。246でもまだ滑りすぎだった
-static uint8_t inrt_scrl_peak = 25;   // スクロール: ピーク 0.25段/tick 以上
-// ★ スクロールはポインタと桁が違う。分周後の速度は 0.3〜0.5段/コマしかない。
-//   ポインタと同じ kick/decay/停止しきい値を使うと、滑り出す前に
-//   停止条件（0.5）を満たしてしまい、一度も動かない。実際そうなっていた。
-static uint8_t inrt_scrl_kick  = 220; // スクロールの滑り出し /256
-static uint8_t inrt_scrl_decay = 249; // スクロールの減衰 /256
-static bool    inrt_enabled   = true;
+// 0xB6 で書き換えられる。既定値は実測に基づく。
+static uint8_t inrt_peak_min   = 6;   // この速度を超えたら慣性を許可（実測: 小移動2 / フリック6〜17）
+static uint8_t inrt_kick       = 250; // 引き継ぐ割合 /256。256に近いほど段差が消える
+static uint8_t inrt_decay      = 238; // 減衰 /256。238≒0.930
+static uint8_t inrt_scrl_peak  = 25;  // スクロール: 0.25段/コマ
+static uint8_t inrt_scrl_kick  = 250;
+static uint8_t inrt_scrl_decay = 246;
+static bool    inrt_enabled    = true;
 
-// ピークを忘れる速さ。指を離してから空転が終わるまで覚えていられる長さにする。
-#    define INRT_PEAK_DECAY 252   // /256 ≒ 0.984。300msで約1/100
+// 掴んで止めたと判定する、直前のボール速度。これ未満から0になっただけなら
+// 自然に回り終わっただけとみなす。
+#    define INRT_GRAB      (3 * INRT_ONE)
+#    define INRT_SCRL_GRAB (INRT_ONE / 4)
 
 typedef struct {
-    int32_t vx, vy;      // いまの速度
-    int32_t px, py;      // ピーク時の速度（向きも保つ）
-    int32_t peak;        // ピークの大きさ |px|+|py|
-    int32_t rx, ry;      // 整数に落とし切れなかった端数
-    bool    coasting;
+    int32_t cx, cy;    // 慣性の速度。これを出す
+    int32_t rx, ry;    // 整数に落とし切れなかった端数
+    int32_t lastMag;   // 直前のボール速度の大きさ
+    bool    armed;     // 十分速く動かされた＝慣性を出してよい
 } inrt_t;
 
-static inrt_t   inrt_move, inrt_scrl;
+static inrt_t inrt_move, inrt_scrl;
 static uint32_t inrt_last = 0;
 
 static void inrt_reset(inrt_t *s) {
-    s->vx = s->vy = s->px = s->py = s->peak = s->rx = s->ry = 0;
-    s->coasting = false;
+    s->cx = s->cy = s->rx = s->ry = s->lastMag = 0;
+    s->armed = false;
 }
 
-bool keyball_inertia_is_enabled(void) {
-    return inrt_enabled;
-}
+bool keyball_inertia_is_enabled(void) { return inrt_enabled; }
 
 static void inrt_stop_all(void) {
     inrt_reset(&inrt_move);
     inrt_reset(&inrt_scrl);
 }
 
-/// ピークを更新し、少しずつ忘れる。
-/// 「止まった瞬間」ではなく「直近で一番速かったとき」を基準にするための記憶。
-static void inrt_peak_update(inrt_t *s) {
-    int32_t mag = labs(s->vx) + labs(s->vy);
-    if (mag > s->peak) {
-        s->peak = mag;
-        s->px   = s->vx;
-        s->py   = s->vy;
-    } else {
-        s->peak = (s->peak * INRT_PEAK_DECAY) >> INRT_SHIFT;
-        s->px   = (s->px * INRT_PEAK_DECAY) >> INRT_SHIFT;
-        s->py   = (s->py * INRT_PEAK_DECAY) >> INRT_SHIFT;
-    }
-}
+/// 1コマ分の処理。ボールの値 (bx,by) を受け取り、出す値を (*ox,*oy) に返す。
+/// 戻り値 true なら慣性が上書きした。
+///
+/// ★ 第2版までは「ボールが完全に止まってから滑り出す」方式で、2つ問題があった。
+///   ① 止まった瞬間に速度が 1 から 9 へ跳ね、カクッと段差ができる
+///   ② 滑走中はボールが止まっているので、指を置いても信号が出ず、止められない
+///   → ボールの空転と慣性を重ね、大きい方を出す方式に変えた。
+///     段差が消え、滑走中もボールが回っているので掴めば急停止として検出できる。
+static bool inrt_run(inrt_t *s, int32_t bx, int32_t by,
+                     int32_t arm_min, uint8_t kick, uint8_t decay,
+                     int32_t stop_at, int32_t grab_at, int8_t *ox, int8_t *oy) {
+    int32_t bmag = labs(bx) + labs(by);
+    int32_t cmag = labs(s->cx) + labs(s->cy);
 
-/// ポインタ用。重み1/2。減速にも素早く追従する。
-static void inrt_track(inrt_t *s, int16_t dx, int16_t dy) {
-    // ★ 滑走中にボールが動いた＝利用者が掴んで止めにきた。
-    //   ここでピークごと捨てないと、手を離した瞬間に同じピークで
-    //   また滑り出して「止めても止まらない」ことになる。実際そうなった。
-    if (s->coasting) {
-        inrt_reset(s);
-    }
-    s->vx = (s->vx + ((int32_t)dx << INRT_SHIFT)) / 2;
-    s->vy = (s->vy + ((int32_t)dy << INRT_SHIFT)) / 2;
-    inrt_peak_update(s);
-    s->coasting = false;
-    s->rx = s->ry = 0;
-}
-
-/// スクロール用。「1コマあたり何段出たか」の割合。
-/// ★ 段が出なかったコマ（0）も必ず入れること。分周後は0か1しか出ないので、
-///   出たコマだけ平均するとゆっくり回しても弾いても同じ1になる。
-static void inrt_rate(inrt_t *s, int8_t h, int8_t v) {
-    if (s->coasting && (h != 0 || v != 0)) {
-        inrt_reset(s);   // 滑走中に触られたら捨てる（inrt_track と同じ理由）
-    }
-    s->vx = (s->vx * 15 + ((int32_t)h << INRT_SHIFT)) / 16;
-    s->vy = (s->vy * 15 + ((int32_t)v << INRT_SHIFT)) / 16;
-    inrt_peak_update(s);
-}
-
-/// 滑走を1コマ進める。出す量を *ox,*oy に返す。まだ滑るなら true。
-static bool inrt_step(inrt_t *s, int32_t peak_min, uint8_t kick, uint8_t decay,
-                      int32_t stop_at, int8_t *ox, int8_t *oy) {
-    if (!s->coasting) {
-        // ★ 止まった瞬間の速度ではなくピークで判定する。
-        //   空転で 1 まで落ちていても、直前に速ければ滑らせる。
-        if (!inrt_enabled || s->peak < peak_min) {
-            inrt_reset(s);
-            return false;
-        }
-        // ピークの何割かから始める。ボールの空転が終わったところを引き継ぐので、
-        // ピークそのままだと速すぎて跳ねて見える。
-        s->vx = (s->px * kick) >> INRT_SHIFT;
-        s->vy = (s->py * kick) >> INRT_SHIFT;
+    if (bmag >= cmag) {
+        // ボールの方が速い＝まだ回されている。慣性の速度をボールに合わせる。
+        s->cx = (bx * kick) >> INRT_SHIFT;
+        s->cy = (by * kick) >> INRT_SHIFT;
         s->rx = s->ry = 0;
-        s->coasting = true;
-        // ピークは使い切る。1回の弾きで滑るのは1回だけ。
-        s->peak = 0;
-        s->px = s->py = 0;
+        if (bmag >= arm_min) s->armed = true;
+        s->lastMag = bmag;
+        return false;                     // ボールの値をそのまま通す
     }
-    s->vx = (s->vx * decay) >> INRT_SHIFT;
-    s->vy = (s->vy * decay) >> INRT_SHIFT;
-    if (labs(s->vx) + labs(s->vy) < stop_at) {
+
+    if (!inrt_enabled || !s->armed) {
         inrt_reset(s);
         return false;
     }
-    s->rx += s->vx;
-    s->ry += s->vy;
-    // 負数の算術右シフトは床関数になる。端数を引き戻すので誤差は溜まらない。
+    // ★ 掴んで止められた。回っていたボールが急に0になったら指が触れたとみなす。
+    //   自然に回り終わる場合は 3→2→1→0 と落ちるので lastMag が小さく、ここに来ない。
+    if (bmag == 0 && s->lastMag >= grab_at) {
+        inrt_reset(s);
+        return false;
+    }
+    s->lastMag = bmag;
+
+    s->cx = (s->cx * decay) >> INRT_SHIFT;
+    s->cy = (s->cy * decay) >> INRT_SHIFT;
+    if (labs(s->cx) + labs(s->cy) < stop_at) {
+        inrt_reset(s);
+        return false;
+    }
+    s->rx += s->cx;
+    s->ry += s->cy;
+    // 負数の算術右シフトは床関数。端数を引き戻すので誤差は溜まらない。
     int32_t px = s->rx >> INRT_SHIFT;
     int32_t py = s->ry >> INRT_SHIFT;
     s->rx -= px << INRT_SHIFT;
     s->ry -= py << INRT_SHIFT;
-    // MOUSE_EXTENDED_REPORT は無効なので int8 に収める
     *ox = px > 127 ? 127 : (px < -127 ? -127 : (int8_t)px);
     *oy = py > 127 ? 127 : (py < -127 ? -127 : (int8_t)py);
     return true;
@@ -272,24 +241,18 @@ static bool inrt_step(inrt_t *s, int32_t peak_min, uint8_t kick, uint8_t decay,
 report_mouse_t pointing_device_task_user(report_mouse_t r) {
     bool scroll = keyball_get_scroll_mode();
 
-    // モードが変わったら滑走は打ち切る。x/y と h/v をまたいで滑らせない
     static bool last_scroll = false;
-    if (scroll != last_scroll) {
+    if (scroll != last_scroll) {   // x/y と h/v をまたいで滑らせない
         last_scroll = scroll;
         inrt_stop_all();
     }
-
-    // ボタンを押している間は滑らせない。ドラッグ中に勝手に動くと困る
-    if (r.buttons) {
+    if (r.buttons) {               // ドラッグ中に勝手に動くと困る
         inrt_stop_all();
         return r;
     }
 
-    // ★ 8ms のコマ送り。動きがあったコマは必ず処理し、無かったコマは
-    //   前回から 8ms 経ってから処理する。
-    //   この関数は 1ms ごとに呼ばれるが、keyball はセンサ値を 8ms に1回しか
-    //   出さない。その合間の「値が0のコマ」を指を離したと誤認すると、
-    //   ボールを動かしている最中に滑り出してしまう。
+    // 8ms のコマ送り。keyball はセンサ値を 8ms に1回しか出さないので、
+    // その合間の「値が0のコマ」を数えると空転を見誤る。
     uint32_t now    = timer_read32();
     bool     moving = scroll ? (r.h != 0 || r.v != 0) : (r.x != 0 || r.y != 0);
     if (!moving && TIMER_DIFF_32(now, inrt_last) < INRT_TICK_MS) {
@@ -298,32 +261,20 @@ report_mouse_t pointing_device_task_user(report_mouse_t r) {
     inrt_last = now;
 
     int8_t ox = 0, oy = 0;
-
     if (scroll) {
-        // 滑走中は自分の出した値を食べ直さないよう更新しない
-        if (!inrt_scrl.coasting) {
-            inrt_rate(&inrt_scrl, r.h, r.v);
-        }
-        if (moving) {
-            inrt_scrl.coasting = false;
-            inrt_scrl.rx = inrt_scrl.ry = 0;
-            return r;
-        }
-        // 停止しきい値もスクロール用に下げる。ここが 0.5 のままだと一度も動かない。
-        if (inrt_step(&inrt_scrl, ((int32_t)inrt_scrl_peak * INRT_ONE) / 100,
-                      inrt_scrl_kick, inrt_scrl_decay, INRT_ONE / 16, &ox, &oy)) {
+        if (inrt_run(&inrt_scrl, (int32_t)r.h << INRT_SHIFT, (int32_t)r.v << INRT_SHIFT,
+                     ((int32_t)inrt_scrl_peak * INRT_ONE) / 100,
+                     inrt_scrl_kick, inrt_scrl_decay,
+                     INRT_ONE / 16, INRT_SCRL_GRAB, &ox, &oy)) {
             r.h = ox;
             r.v = oy;
         }
         return r;
     }
-
-    if (moving) {
-        inrt_track(&inrt_move, r.x, r.y);
-        return r;
-    }
-    if (inrt_step(&inrt_move, (int32_t)inrt_peak_min * INRT_ONE,
-                  inrt_kick, inrt_decay, INRT_ONE / 2, &ox, &oy)) {
+    if (inrt_run(&inrt_move, (int32_t)r.x << INRT_SHIFT, (int32_t)r.y << INRT_SHIFT,
+                 (int32_t)inrt_peak_min * INRT_ONE,
+                 inrt_kick, inrt_decay,
+                 INRT_ONE / 2, INRT_GRAB, &ox, &oy)) {
         r.x = ox;
         r.y = oy;
     }
@@ -350,7 +301,6 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 ///   要求: B6 00  → 現在値を返す
 ///        B6 01 <peak> <kick> <decay> <scrlPeak> <enabled> <scrlKick> <scrlDecay>
 ///        （0 は「変えない」の意味）
-/// 返事: B6 <peak> <kick> <decay> <scrlPeak> <enabled> <scrlKick> <scrlDecay>
 void keyball_inertia_command(uint8_t *d, uint8_t len) {
     if (len >= 7 && d[1] == 1) {
         if (d[2] > 0) inrt_peak_min = d[2];
