@@ -171,8 +171,22 @@ void pointing_device_driver_set_cpi(uint16_t cpi) {
 
 __attribute__((weak)) void keyball_on_apply_motion_to_mouse_move(keyball_motion_t *m, report_mouse_t *r, bool is_left) {
 #if KEYBALL_MODEL == 61 || KEYBALL_MODEL == 39 || KEYBALL_MODEL == 147 || KEYBALL_MODEL == 44
+    // センサーを基板上で回して実装した場合の補正。
+    // KEYBALL_SENSOR_ROTATE_{90,180,270} を keymap の config.h で定義する。
+    // 未定義なら純正と同じ挙動。
+#    if defined(KEYBALL_SENSOR_ROTATE_90)
+    r->x = clip2int8(m->x);
+    r->y = -clip2int8(m->y);
+#    elif defined(KEYBALL_SENSOR_ROTATE_180)
+    r->x = -clip2int8(m->y);
+    r->y = -clip2int8(m->x);
+#    elif defined(KEYBALL_SENSOR_ROTATE_270)
+    r->x = -clip2int8(m->x);
+    r->y = clip2int8(m->y);
+#    else
     r->x = clip2int8(m->y);
     r->y = clip2int8(m->x);
+#    endif
     if (is_left) {
         r->x = -r->x;
         r->y = -r->y;
@@ -196,8 +210,20 @@ __attribute__((weak)) void keyball_on_apply_motion_to_mouse_scroll(keyball_motio
 
     // apply to mouse report.
 #if KEYBALL_MODEL == 61 || KEYBALL_MODEL == 39 || KEYBALL_MODEL == 147 || KEYBALL_MODEL == 44
+    // move 側と同じ回転をスクロールにも掛ける（片方だけだと90°ずれる）
+#    if defined(KEYBALL_SENSOR_ROTATE_90)
+    r->h = clip2int8(x);
+    r->v = clip2int8(y);
+#    elif defined(KEYBALL_SENSOR_ROTATE_180)
+    r->h = -clip2int8(y);
+    r->v = clip2int8(x);
+#    elif defined(KEYBALL_SENSOR_ROTATE_270)
+    r->h = -clip2int8(x);
+    r->v = -clip2int8(y);
+#    else
     r->h = clip2int8(y);
     r->v = -clip2int8(x);
+#    endif
     if (is_left) {
         r->h = -r->h;
         r->v = -r->v;
