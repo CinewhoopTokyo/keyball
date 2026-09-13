@@ -37,6 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // VIAのコマンドIDは 0x00〜0x0E 付近と 0xFF。衝突しない値を選ぶ。
 #    define KBSTAT_CMD     0xB5
 #    define INRT_CMD       0xB6   // 慣性の調整値の読み書き
+#    define BOOT_CMD       0xB7   // ブートローダへ飛ぶ（書き込みのためのリセット省略用）
 #    define KBSTAT_VERSION 8   // 8: スクロールを均してから渡す（掴み検出の誤爆を修正）
 
 #    ifdef POINTING_DEVICE_ENABLE
@@ -109,6 +110,27 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
         return true;
     }
 #    endif
+    // ブートローダへ飛ぶ。KeyballOLED.app がファームを書き込む前に投げる。
+    //
+    // VIA の id_bootloader_jump(0x0B) は enum に定義があるだけで QMK 0.22.14 の
+    // via.c に実装が無い（Remapが毎回「リセットしてください」と言う理由）。
+    // こちらで口を用意する。
+    //
+    // ★合言葉 "KB!" を要求する。0xB7 単発では飛ばさない。
+    //   ホスト側の書き間違いや無関係なパケットで不意にブートローダへ落ちると、
+    //   キーボードが数秒間まるごと反応しなくなって原因が掴みにくい。
+    //
+    // USB が挿さっている側の半身だけが受け取る＝焼く側だけが落ちる。これは意図どおり。
+    if (length >= 4 && data[0] == BOOT_CMD) {
+        bool ok = (data[1] == 'K' && data[2] == 'B' && data[3] == '!');
+        data[1] = ok ? 0x01 : 0x00;
+        raw_hid_send(data, length);
+        if (ok) {
+            wait_ms(100);        // ホストが返事を読む時間を与える
+            bootloader_jump();   // 戻ってこない
+        }
+        return true;
+    }
     return false;
 }
 #endif  // RAW_ENABLE && VIA_ENABLE
